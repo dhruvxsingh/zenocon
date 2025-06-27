@@ -15,8 +15,8 @@ interface Customer {
   };
 }
 
-// Mock database with state management
-const mockCustomersDB: Record<string, Customer> = {};
+// In-memory database - persists between requests during server runtime
+const customersDB = new Map<string, Customer>();
 
 // WhatsApp API configuration
 const WHATSAPP_API_URL = `https://graph.facebook.com/v17.0/${process.env.META_PHONE_NUMBER_ID}/messages`;
@@ -61,21 +61,78 @@ export async function POST(request: Request) {
 
     if (!customerNumber) return NextResponse.json({ status: 'ok' });
 
-    let customer = mockCustomersDB[customerNumber] || {
-      points: 0,
-      registrationStep: undefined,
-      addressStep: undefined,
-    };
+    // Get or create customer from in-memory database
+    let customer = customersDB.get(customerNumber);
+    
+    // Check if returning customer
+    if (!customer) {
+      // New customer
+      customer = {
+        points: 0,
+        registrationStep: undefined,
+        addressStep: undefined,
+      };
+      customersDB.set(customerNumber, customer);
+      
+      // Send welcome message with register button
+      await sendWhatsAppMessage(customerNumber, {
+        type: 'interactive',
+        interactive: {
+          type: 'button',
+          body: { 
+            text: `Welcome ${customerName}! 🎉\n\nI'm your food ordering assistant. Let's get you started with a quick registration.\n\nYou'll earn 100 bonus points! 🎁` 
+          },
+          action: {
+            buttons: [
+              {
+                type: 'reply',
+                reply: { id: 'start_registration', title: '✅ Start Registration' },
+              },
+            ],
+          },
+        },
+      });
+      return NextResponse.json({ status: 'ok' });
+    }
+    
+    // Returning customer check
+    if (customer.registrationStep === 'complete' && 
+        (customer.addressStep === 'complete' || !customer.addressStep) && 
+        messageType === 'text') {
+      
+      const messageBody = message.text?.body?.toLowerCase().trim();
+      
+      // Check if it's a menu request or just a greeting
+      if (messageBody === 'menu') {
+        // Show menu (implement later)
+        await sendWhatsAppMessage(customerNumber, {
+          type: 'text',
+          text: {
+            body: `🍕 Menu coming soon!\n\nFor now, here are our categories:\n1. Pizza\n2. Burgers\n3. Beverages`,
+          },
+        });
+      } else {
+        // Show welcome back message
+        await sendWhatsAppMessage(customerNumber, {
+          type: 'text',
+          text: {
+            body: `Welcome back, ${customer.name}! 🎉\n\nYou have ${customer.points} loyalty points.\n\nType "MENU" to start ordering!`,
+          },
+        });
+      }
+      
+      return NextResponse.json({ status: 'ok' });
+    }
 
     // Handle different message types
     if (messageType === 'text') {
       const messageBody = message.text?.body?.toLowerCase().trim();
       
-      // Check if we're in registration flow
-      if (messageBody === 'register' || (customer.registrationStep && customer.registrationStep !== 'complete')) {
+      // Registration flow
+      if (customer.registrationStep && customer.registrationStep !== 'complete') {
         await handleRegistrationFlow(customerNumber, customer, messageBody);
       }
-      // Check if we're in address flow
+      // Address flow - text input
       else if (customer.addressStep === 'awaiting_text') {
         customer.address = { text: message.text.body };
         await confirmAddress(customerNumber, customer);
@@ -83,19 +140,6 @@ export async function POST(request: Request) {
       else if (customer.addressStep === 'awaiting_details') {
         customer.address = { ...customer.address, details: message.text.body };
         await confirmAddress(customerNumber, customer);
-      }
-      // Initial message
-      else if (!mockCustomersDB[customerNumber]) {
-        await sendWhatsAppMessage(customerNumber, {
-          type: 'text',
-          text: {
-            body: `Welcome ${customerName}! Type "REGISTER" to start ordering. You'll get 100 bonus points!`,
-          },
-        });
-      }
-      // Returning customer
-      else if (customer.registrationStep === 'complete' && !customer.addressStep) {
-        await startAddressFlow(customerNumber, customer);
       }
     }
     else if (messageType === 'interactive') {
@@ -120,7 +164,13 @@ export async function POST(request: Request) {
       }
     }
 
-    mockCustomersDB[customerNumber] = customer;
+    // Save updated customer data
+    customersDB.set(customerNumber, customer);
+    
+    // Log current database state (for debugging)
+    console.log(`Total customers in memory: ${customersDB.size}`);
+    console.log(`Customer ${customerNumber} data:`, customer);
+    
     return NextResponse.json({ status: 'ok' });
   } catch (error) {
     console.error('Error in webhook:', error);
@@ -129,8 +179,16 @@ export async function POST(request: Request) {
 }
 
 async function handleButtonResponse(phone: string, customer: Customer, buttonId: string) {
+  // Start registration button
+  if (buttonId === 'start_registration') {
+    customer.registrationStep = 'name';
+    await sendWhatsAppMessage(phone, {
+      type: 'text',
+      text: { body: "Great! Let's start with your name.\n\nWhat's your full name?" },
+    });
+  }
   // Registration buttons
-  if (buttonId === 'email_yes') {
+  else if (buttonId === 'email_yes') {
     customer.registrationStep = 'email_pending';
     await sendWhatsAppMessage(phone, {
       type: 'text',
@@ -183,29 +241,23 @@ async function handleButtonResponse(phone: string, customer: Customer, buttonId:
 }
 
 async function handleRegistrationFlow(phone: string, customer: Customer, message: string) {
-  if (!customer.registrationStep || message === 'register') {
-    customer.registrationStep = 'name';
-    await sendWhatsAppMessage(phone, {
-      type: 'text',
-      text: { body: "Great! What's your full name?" },
-    });
-  } else if (customer.registrationStep === 'name') {
+  if (customer.registrationStep === 'name') {
     customer.name = message;
     customer.registrationStep = 'email';
     await sendWhatsAppMessage(phone, {
       type: 'interactive',
       interactive: {
         type: 'button',
-        body: { text: 'Would you like to provide your email for receipts and updates?' },
+        body: { text: `Nice to meet you, ${customer.name}! 👋\n\nWould you like to provide your email for order receipts and exclusive offers?` },
         action: {
           buttons: [
             {
               type: 'reply',
-              reply: { id: 'email_yes', title: 'Yes, provide email' },
+              reply: { id: 'email_yes', title: 'Yes, add email' },
             },
             {
               type: 'reply',
-              reply: { id: 'email_no', title: 'Skip email' },
+              reply: { id: 'email_no', title: 'Skip for now' },
             },
           ],
         },
@@ -235,7 +287,7 @@ async function completeRegistration(phone: string, customer: Customer) {
   await sendWhatsAppMessage(phone, {
     type: 'text',
     text: {
-      body: `🎉 Registration complete, ${customer.name}! You've earned 100 bonus points.\n\nNext, we'll need your delivery address.`,
+      body: `🎉 Registration complete, ${customer.name}!\n\n✅ You've earned 100 bonus points\n💰 Current balance: ${customer.points} points\n\nNext, we'll need your delivery address.`,
     },
   });
 
@@ -304,7 +356,7 @@ async function confirmAddress(phone: string, customer: Customer) {
   });
 }
 
-// Add GET handler for webhook verification
+// GET handler for webhook verification
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   
