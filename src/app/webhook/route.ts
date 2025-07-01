@@ -6,12 +6,20 @@ interface Customer {
   email?: string;
   points: number;
   registrationStep?: 'start' | 'name' | 'email' | 'email_pending' | 'complete';
-  addressStep?: 'awaiting_method' | 'awaiting_location' | 'awaiting_text' | 'awaiting_details' | 'confirming' | 'complete';
+  addressStep?: 'awaiting_method' | 'awaiting_location' | 'awaiting_text' | 'awaiting_details' | 'confirming' | 'complete' | 'flow_sent'; // Added 'flow_sent' here
   address?: {
     text?: string;
     location?: { latitude: number; longitude: number };
     details?: string;
     confirmed?: string;
+    flowAddress?: {
+      delivery_address?: string;
+      house_number?: string;
+      area?: string;
+      landmark?: string;
+      instructions?: string;
+      pincode?: string;
+    };
   };
 }
 
@@ -143,26 +151,55 @@ export async function POST(request: Request) {
       }
     }
     else if (messageType === 'interactive') {
-      const buttonId = message.interactive?.button_reply?.id;
-      await handleButtonResponse(customerNumber, customer, buttonId);
+  // Check if it's a flow response
+  if (message.interactive?.type === 'nfm_reply') {
+    if (customer.addressStep === 'flow_sent') {
+      const flowData = JSON.parse(message.interactive.nfm_reply.response_json);
+      
+      // Store the address from flow
+      customer.address = {
+        flowAddress: {
+          delivery_address: flowData.screen_0_Delivery_address_0,
+          house_number: flowData.screen_0_House_Number_1,
+          area: flowData.screen_0_Area_2,
+          landmark: flowData.screen_0_Landmark_3,
+          instructions: flowData.screen_0_Instructions_4,
+          pincode: flowData.screen_0_Pincode_5
+        }
+      };
+      customer.addressStep = 'complete';
+      
+      // Confirm and show menu
+      await sendWhatsAppMessage(customerNumber, {
+        type: 'text',
+        text: {
+          body: `✅ Address saved successfully!\n\n📍 ${flowData.screen_0_Delivery_address_0}\nHouse: ${flowData.screen_0_House_Number_1}\nArea: ${flowData.screen_0_Area_2}\nPincode: ${flowData.screen_0_Pincode_5}\n\n🍕 Great! Type "MENU" to see our offerings!`,
+        },
+      });
     }
-    else if (messageType === 'location') {
-      if (customer.addressStep === 'awaiting_location') {
-        customer.address = {
-          location: {
-            latitude: message.location.latitude,
-            longitude: message.location.longitude,
-          },
-        };
-        customer.addressStep = 'awaiting_details';
-        await sendWhatsAppMessage(customerNumber, {
-          type: 'text',
-          text: {
-            body: '📍 Got your location!\n\nPlease provide additional details:\n• Building/House name\n• Floor number\n• Landmark\n• Delivery instructions',
-          },
-        });
-      }
-    }
+  } else {
+    const buttonId = message.interactive?.button_reply?.id;
+    await handleButtonResponse(customerNumber, customer, buttonId);
+  }
+}
+else if (messageType === 'location') {
+  // Keep your existing location handling code
+  if (customer.addressStep === 'awaiting_location') {
+    customer.address = {
+      location: {
+        latitude: message.location.latitude,
+        longitude: message.location.longitude,
+      },
+    };
+    customer.addressStep = 'awaiting_details';
+    await sendWhatsAppMessage(customerNumber, {
+      type: 'text',
+      text: {
+        body: '📍 Got your location!\n\nPlease provide additional details:\n• Building/House name\n• Floor number\n• Landmark\n• Delivery instructions',
+      },
+    });
+  }
+}
 
     // Save updated customer data
     customersDB.set(customerNumber, customer);
@@ -240,6 +277,37 @@ async function handleButtonResponse(phone: string, customer: Customer, buttonId:
   }
 }
 
+async function sendAddressFlow(phone: string) {
+  const flowMessage = {
+    type: 'interactive',
+    interactive: {
+      type: 'flow',
+      header: {
+        type: 'text',
+        text: 'Delivery Address'
+      },
+      body: {
+        text: 'Please fill in your delivery address'
+      },
+      action: {
+        name: 'flow',
+        parameters: {
+          flow_message_version: '3',
+          flow_action: 'navigate',
+          flow_token: 'unused',
+          flow_id: process.env.WHATSAPP_FLOW_ID,
+          flow_cta: 'Enter Address',
+          flow_action_payload: {
+            screen: 'QUESTION_ONE'  // Changed to match your flow
+          }
+        }
+      }
+    }
+  };
+
+  return await sendWhatsAppMessage(phone, flowMessage);
+}
+
 async function handleRegistrationFlow(phone: string, customer: Customer, message: string) {
   if (customer.registrationStep === 'name') {
     customer.name = message;
@@ -290,34 +358,21 @@ async function completeRegistration(phone: string, customer: Customer) {
       body: `🎉 Registration complete, ${customer.name}!\n\n✅ You've earned 100 bonus points\n💰 Current balance: ${customer.points} points\n\nNext, we'll need your delivery address.`,
     },
   });
+    console.log('About to start address flow for:', phone);
 
-  // Start address flow after 2 seconds
-  setTimeout(() => startAddressFlow(phone, customer), 2000);
+
+  // Directly start address flow
+  await startAddressFlow(phone, customer);
 }
 
 async function startAddressFlow(phone: string, customer: Customer) {
-  customer.addressStep = 'awaiting_method';
+    console.log('Starting address flow for:', phone);
+
+  customer.addressStep = 'flow_sent';
   customer.address = {}; // Reset address
   
-  await sendWhatsAppMessage(phone, {
-    type: 'interactive',
-    interactive: {
-      type: 'button',
-      body: { text: 'How would you like to provide your delivery address?' },
-      action: {
-        buttons: [
-          {
-            type: 'reply',
-            reply: { id: 'share_location', title: '📍 Share Location' },
-          },
-          {
-            type: 'reply',
-            reply: { id: 'type_address', title: '📝 Type Address' },
-          },
-        ],
-      },
-    },
-  });
+  // Directly send the flow
+  await sendAddressFlow(phone);
 }
 
 async function confirmAddress(phone: string, customer: Customer) {
